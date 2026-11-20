@@ -10,8 +10,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# Writable home for the cpuset controller's simulated cgroup tree and
+# operation journal; mounted as a persistent volume by docker-compose.
 RUN useradd --create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /srv
+    && mkdir -p /var/lib/cpuset-controller \
+    && chown -R appuser:appuser /srv /var/lib/cpuset-controller
 USER appuser
 
 EXPOSE 8000

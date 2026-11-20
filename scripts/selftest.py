@@ -12,6 +12,12 @@ in terms of path set, entry type and file contents.
 It also exercises the invalid-input paths and confirms those return HTTP 400
 with no downloadable artifact.
 
+The ``--with-cpuset`` flag additionally drives the ``/cpuset/*`` re-pinning
+API through its key scenarios: a CPU swap performed via borrowed idle CPUs,
+an unreachable target that must preserve the existing allocation, operation
+mutex and the write-interruption/restart/resume flow (the latter requires the
+service to be started with ``CPSET_FAIL_ON_WRITE``).
+
 Run against a locally started service, e.g.:
 
     python -I scripts/selftest.py --base-url http://127.0.0.1:8000
@@ -27,7 +33,7 @@ import tarfile
 import urllib.error
 import urllib.request
 import uuid
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # --------------------------------------------------------------------------- #
 # minimal tar builder (no third-party dependencies)
@@ -207,6 +213,156 @@ def post_merge(base_url: str, lower: bytes, upper: bytes) -> Tuple[int, bytes, d
 
 
 # --------------------------------------------------------------------------- #
+# cpuset re-pinning HTTP helpers (stdlib only)
+# --------------------------------------------------------------------------- #
+
+def _http_json(method: str, url: str, payload: Optional[dict] = None) -> Tuple[int, dict]:
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read().decode())
+        except json.JSONDecodeError:
+            return exc.code, {}
+
+
+def cpuset_allocation(base_url: str) -> Tuple[int, dict]:
+    return _http_json("GET", base_url.rstrip("/") + "/cpuset/allocation")
+
+
+def cpuset_rebind(base_url: str, online: List[int], batch: List[int]) -> Tuple[int, dict]:
+    return _http_json(
+        "POST",
+        base_url.rstrip("/") + "/cpuset/rebind",
+        {"online_cpus": online, "batch_cpus": batch},
+    )
+
+
+def cpuset_resume(base_url: str, operation_id: str) -> Tuple[int, dict]:
+    return _http_json(
+        "POST",
+        base_url.rstrip("/") + f"/cpuset/operations/{operation_id}/resume",
+    )
+
+
+def cpuset_get_operation(base_url: str, operation_id: str) -> Tuple[int, dict]:
+    return _http_json(
+        "GET", base_url.rstrip("/") + f"/cpuset/operations/{operation_id}"
+    )
+
+
+def run_cpuset_selftest(base_url: str) -> int:
+    """Exercise the cpuset API end to end against the running service."""
+    failures = 0
+
+    def check(condition: bool, label: str) -> None:
+        nonlocal failures
+        if condition:
+            print(f"[ OK ] {label}")
+        else:
+            failures += 1
+            print(f"[FAIL] {label}")
+
+    status, initial = cpuset_allocation(base_url)
+    check(status == 200, "cpuset allocation endpoint reachable")
+    if status != 200:
+        return failures + 1
+    parent = set(initial["parent_cpus"])
+    check(len(parent) <= 8, f"parent owns at most 8 CPUs (got {sorted(parent)})")
+    start_online = initial["groups"]["online"]["cpus"]
+    start_batch = initial["groups"]["batch"]["cpus"]
+    check(
+        not (set(start_online) & set(start_batch)),
+        "initial groups do not share a CPU",
+    )
+
+    # 1. Borrow-idle-CPU swap: online and batch exchange cores.  Pick targets
+    #    that require intermediate borrowing regardless of the initial split.
+    idle = sorted(parent - set(start_online) - set(start_batch))
+    if len(idle) >= 1 and len(start_batch) >= 1:
+        target_online = sorted(set(start_batch) | {idle[0]})
+        target_batch = sorted(start_online)
+        if len(target_online) >= initial["groups"]["online"]["min_cpus"] and not (
+            set(target_online) & set(target_batch)
+        ):
+            status, op = cpuset_rebind(base_url, target_online, target_batch)
+            check(status == 200 and op["status"] == "done", "borrow-and-swap rebind accepted")
+            # Every intermediate move changes exactly one group and stays legal.
+            online, batch = set(start_online), set(start_batch)
+            legal_trace = True
+            for step in op["plan"]:
+                cpus = set(step["cpus"])
+                if step["group"] == "online":
+                    if batch & cpus or len(cpus) < initial["groups"]["online"]["min_cpus"]:
+                        legal_trace = False
+                    online = cpus
+                else:
+                    if online & cpus or len(cpus) < initial["groups"]["batch"]["min_cpus"]:
+                        legal_trace = False
+                    batch = cpus
+            check(legal_trace, "every swap step keeps minimums and no shared CPU")
+            status, after = cpuset_allocation(base_url)
+            check(
+                after["groups"]["online"]["cpus"] == target_online
+                and after["groups"]["batch"]["cpus"] == target_batch,
+                "actual allocation matches swap targets",
+            )
+            # Operation lookup and listing.
+            status, detail = cpuset_get_operation(base_url, op["operation_id"])
+            check(status == 200 and detail["status"] == "done", "operation lookup by id")
+            # Restore the starting allocation so repeated runs stay stable.
+            status, restore = cpuset_rebind(base_url, start_online, start_batch)
+            check(status == 200 and restore["status"] == "done", "restore starting allocation")
+    else:
+        print("[skip] borrow-and-swap: parent has no idle CPU to borrow")
+
+    # 2. Invalid targets are rejected with 400 and leave no journal entry.
+    status, bad = cpuset_rebind(base_url, [max(parent) + 1], start_batch)
+    check(status == 400, "cpu outside parent rejected with 400")
+    overlap_target = [start_online[0]]
+    status, bad = cpuset_rebind(base_url, start_online, overlap_target)
+    check(status == 400, "overlapping targets rejected with 400")
+
+    # 3. Write-interruption / resume flow.  Only meaningful when the service
+    #    was started with CPSET_FAIL_ON_WRITE; otherwise it is skipped.
+    status, probe = cpuset_allocation(base_url)
+    spare = sorted(parent - set(start_online) - set(start_batch))
+    if len(spare) >= 2:
+        status, maybe_fault = cpuset_rebind(
+            base_url, sorted(spare[:2]), start_batch
+        )
+        if status == 500 and "interruption" in maybe_fault.get("detail", ""):
+            op_id = cpuset_allocation(base_url)[1]["in_progress_operation"]
+            check(bool(op_id), "interrupted write leaves an in-progress operation")
+            # Other adjustments are rejected until the operation finishes.
+            status, blocked = cpuset_rebind(base_url, start_online, start_batch)
+            check(status == 409 and "not finished" in blocked["detail"],
+                  "new adjustment rejected while operation unfinished")
+            status, resumed = cpuset_resume(base_url, op_id)
+            check(status == 200 and resumed["status"] == "done",
+                  "resume completes the interrupted operation")
+            status, final = cpuset_allocation(base_url)
+            check(final["in_progress_operation"] is None, "no operation in progress after resume")
+            check(final["groups"]["online"]["cpus"] == sorted(spare[:2]),
+                  "actual allocation matches target after resume")
+            cpuset_rebind(base_url, start_online, start_batch)
+        else:
+            print("[skip] write-interruption: service not started with CPSET_FAIL_ON_WRITE")
+    else:
+        print("[skip] write-interruption: not enough spare CPUs in this topology")
+
+    return failures
+
+
+# --------------------------------------------------------------------------- #
 # scenarios
 # --------------------------------------------------------------------------- #
 BASE_ONE = build_tar([
@@ -279,6 +435,11 @@ SCENARIOS = {
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument(
+        "--with-cpuset",
+        action="store_true",
+        help="also exercise the /cpuset re-pinning API end to end",
+    )
     args = parser.parse_args()
 
     failures = 0
@@ -341,6 +502,15 @@ def main() -> int:
         print(f"RESULT: {failures} failure(s)")
         return 1
     print("RESULT: all self-test checks passed on two distinct lower file-systems")
+
+    if args.with_cpuset:
+        print()
+        print("--- cpuset re-pinning self-test ---")
+        cpuset_failures = run_cpuset_selftest(args.base_url)
+        if cpuset_failures:
+            print(f"RESULT: {cpuset_failures} cpuset failure(s)")
+            return 1
+        print("RESULT: all cpuset self-test checks passed")
     return 0
 
 
