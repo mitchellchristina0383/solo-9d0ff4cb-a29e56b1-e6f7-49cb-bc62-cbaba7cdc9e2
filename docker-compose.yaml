@@ -1,0 +1,13 @@
+services:
+  layer-merger:
+    build: .
+    image: oci-layer-merger:1.0.0
+    container_name: oci-layer-merger
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+    security_opt:
+      - no-new-privileges:true
